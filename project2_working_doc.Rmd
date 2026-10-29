@@ -1,0 +1,198 @@
+---
+title: "Project 2 EDA/Initial Model Building"
+author: "Savannah Sauers, Lera Martinez, Simon Tao"
+date: "2026-10-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=TRUE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(ezids)
+library(car)
+library(tidycensus)
+library(sf)
+```
+
+# Data
+**MTA Data**
+```{r}
+project <- read.csv("~/Desktop/Fall 2026/DATS6101/DATS6101_Project_MTA_Subway_Hourly_Ridership.csv")
+# project <- read.csv("~/Desktop/Cloning-Git/DATS6101-project1/DATS6101_Project_MTA_Subway_Hourly_Ridership.csv")
+```
+
+```{r}
+# Make sure columns are cast to correct types
+project$borough <- as.factor(project$borough)
+project$payment_method <- as.factor(project$payment_method)
+project$fare_class_category <- as.factor(project$fare_class_category)
+project$ridership <- as.numeric(gsub(",", "", project$ridership))
+project$transfers <- as.numeric(gsub(",", "", project$transfers))
+
+## Created Variables of Analysis
+# Add 24-hour time column
+project <- project %>%
+  mutate(
+    timestamp = mdy_hms(transit_timestamp),
+    hour = hour(timestamp)
+  )
+
+# Add categories for morning, afternoon, evening, night
+# Morning (5am - 10:59am), afternoon (11am - 3:59pm), evening (4pm - 8:59pm), night (9pm - 4:59am)
+project <- project %>%
+  mutate(
+    time_of_day = case_when(
+      hour >= 5 & hour < 11 ~ "Morning",
+      hour >= 11 & hour < 16 ~ "Mid Day",
+      hour >= 16 & hour < 21 ~ "Evening",
+      TRUE ~ "Night"
+    )
+  )
+
+# Add day of week column
+project <- project %>%
+  mutate(
+    day_of_week = wday(timestamp, label = TRUE)
+  )
+
+# Weekend vs. Weekday column
+project <- project %>%
+  mutate(day_type = if_else(day_of_week %in% c("Sat", "Sun"), "Weekend", "Weekday"))
+
+# Commuter hours column
+project <- project %>%
+  mutate(
+    commute_type = case_when(
+      day_type == "Weekday" & hour >= 5 & hour < 11 ~ "Morning Commute",
+      day_type == "Weekday" & hour >= 16 & hour < 21 ~ "Evening Commute",
+      TRUE ~ "Other Hours"
+    )
+  )
+
+project$time_of_day <- as.factor(project$time_of_day)
+project$day_of_week <- as.factor(project$day_of_week)
+project$day_type <- as.factor(project$day_type)
+project$commute_type <- as.factor(project$commute_type)
+```
+
+**Census Data**
+```{r}
+# census_api_key("e90ad13b47a47b05e58173ad52fcf6d5c9a388b6", install = TRUE, overwrite = TRUE) ### Simon
+# THEN RUN IN CONSOLE --> readRenviron("~/.Renviron")
+```
+
+```{r}
+# Our chosen census variables for the model
+census_variables <- c(
+  population = "B01003_001",
+  median_income = "B19013_001"
+)
+
+nyc_counties <- c(
+  "Bronx", # The Bronx
+  "Kings", # Brooklyn
+  "New York", # Manhattan
+  "Queens" # Queens
+)
+```
+
+```{r}
+nyc_census <- map_dfr(
+  nyc_counties, ~ get_acs(
+    geography = "tract",
+    variables = census_variables,
+    state = "NY",
+    county = .x,
+    year = 2024,
+    survey = "acs5",
+    output = "wide",
+    geometry = TRUE
+  )
+)
+```
+
+**Joining Data**
+```{r}
+# Read in NYC neighborhood data
+neighborhoods <- read.csv("~/Desktop/Fall 2026/DATS6101/2020_Census_Tracts.csv")
+
+# Clean the data for joining
+neighborhoods <- neighborhoods %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  select(GEOID, NTACode, NTAName)
+```
+
+```{r}
+# Join neighborhood names to the census tracts using GEOID
+nyc_census <- nyc_census %>%
+  left_join(neighborhoods, by = "GEOID")
+```
+
+```{r}
+# Create one representative set of coordinates for each station complex
+stations <- project %>%
+  distinct(station_complex_id, station_complex, borough, latitude, longitude) %>%
+  group_by(station_complex_id, station_complex, borough) %>%
+  summarize(latitude = mean(latitude, na.rm = TRUE), longitude = mean(longitude, na.rm = TRUE), .groups = "drop")
+```
+
+```{r}
+# Convert the stations into spatial points, and make sure census data uses the same coordinate system
+stations_sf <- st_as_sf(
+  stations,
+  coords = c("longitude", "latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+nyc_census <- st_transform(
+  nyc_census,
+  crs = 4326
+)
+```
+
+```{r}
+# Spatial join: match each station to the census tract containing its coordinates
+stations_census <- st_join(
+  stations_sf,
+  nyc_census,
+  join = st_within,
+  left = TRUE
+)
+```
+
+```{r}
+# Mapping census and neighborhood data to MTA stations 
+station_info <- stations_census %>%
+  st_drop_geometry() %>%
+  select(
+    station_complex_id,
+    GEOID,
+    NTACode,
+    NTAName,
+    populationE,
+    median_incomeE
+  )
+```
+
+```{r}
+# Final join
+project <- project %>%
+  left_join(
+    station_info,
+    by = "station_complex_id"
+  )
+```
+
+Join the Census tracts to corresponding neighborhoods using GEOID
+Create one specific location point for each station
+Spatially match each station to the Census tract
+Join population, income, and neighborhood to each tract
+Join the results back to MTA data by station ID
+
+Each row in `project` represents the original project 1 data, with:
+- Associated neighborhood (NTA) of that station based on coordinated
+- Associated Census statistics for the tract that the station is in (based on location)
